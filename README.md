@@ -1,5 +1,5 @@
 # 🤖 MLLMRec-R1
-MLLMRec-R1: Incentivizing Reasoning Capability in Large Language Models for Multimodal Sequential Recommendation
+MLLMRec-R1: Incentivizing Reasoning Capability in Large Language Models for Multimodal Sequential Recommendation [[Paper link]](https://arxiv.org/abs/2603.06243)
 
 ## 🏗️ Model Architecture
 <img src='data.png' />
