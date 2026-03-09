@@ -62,7 +62,7 @@ example code: modelscope download --model Qwen/Qwen3-4B --local_dir Qwen3-4B
 ```
 
 # ♻️ Agent Pipeline for Multimodal CoT 
-## ✍️ (Caption → 🧩 Pseudo-CoT → 🧠 Reasoning)
+## (✍️Caption → 🧩 Pseudo-CoT → 🧠 Reasoning)
 If you would like to fully reproduce our data construction process, you can directly use the scripts provided in agent/. 
 
 The recommended pipeline follows three stages in order: (1) caption generation → (2) pseudo-CoT construction → (3) reasoning refinement.
