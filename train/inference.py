@@ -15,25 +15,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.data_loader import RecSFTDataset
 
 
-def resolve_model_source(model_arg: str, root: str):
-    """Resolve model source for HF/local loading and auto-fix accidental ROOT prefix."""
-    if os.path.exists(model_arg):
-        return model_arg, "local"
-
-    norm_model = os.path.normpath(model_arg)
-    norm_root = os.path.normpath(root)
-    root_prefix = norm_root + os.sep
-    if norm_model.startswith(root_prefix):
-        candidate = norm_model[len(root_prefix):].replace(os.sep, "/")
-        if candidate.count("/") >= 1:
-            print(
-                f"[Model Resolver] Detected root-prefixed backbone '{model_arg}'. "
-                f"Auto-convert to HuggingFace repo id '{candidate}'."
-            )
-            return candidate, "hf"
-
-    return model_arg, "hf"
-
 
 METRIC_CUTOFFS = [10, 20, 40]
 
@@ -178,11 +159,10 @@ def main():
 
     if args.sft_tag:
         base_model = f"{args.root}/checkpoints/{args.dataset}/{args.sft_tag}"
-        source_kind = "local"
         print(f"[INF] Step 1/6: Using local SFT model {base_model}")
     else:
-        base_model, source_kind = resolve_model_source(args.backbone, args.root)
-        print(f"[INF] Step 1/6: Using {source_kind} backbone {base_model}")
+        base_model = args.backbone
+        print(f"[INF] Step 1/6: Using HF backbone {base_model}")
 
     print("[INF] Step 2/6: Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)

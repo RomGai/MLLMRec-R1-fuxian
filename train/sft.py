@@ -1,6 +1,4 @@
 import argparse
-import os
-
 import torch
 from datasets import Dataset
 from peft import LoraConfig
@@ -9,25 +7,6 @@ from trl import SFTConfig, SFTTrainer
 
 from utils.data_loader import RecSFTDataset
 
-
-def resolve_model_source(model_arg: str, root: str):
-    """Resolve model source for HF/local loading and auto-fix accidental ROOT prefix."""
-    if os.path.exists(model_arg):
-        return model_arg, "local"
-
-    norm_model = os.path.normpath(model_arg)
-    norm_root = os.path.normpath(root)
-    root_prefix = norm_root + os.sep
-    if norm_model.startswith(root_prefix):
-        candidate = norm_model[len(root_prefix):].replace(os.sep, "/")
-        if candidate.count("/") >= 1:
-            print(
-                f"[Model Resolver] Detected root-prefixed backbone '{model_arg}'. "
-                f"Auto-convert to HuggingFace repo id '{candidate}'."
-            )
-            return candidate, "hf"
-
-    return model_arg, "hf"
 
 
 def parse_args():
@@ -66,14 +45,12 @@ class DetailedProgressCallback(TrainerCallback):
 def main():
     args = parse_args()
 
-    model_source, source_kind = resolve_model_source(args.backbone, args.root)
-
-    print(f"[SFT] Step 1/6: Loading tokenizer from {source_kind}: {model_source}")
-    tokenizer = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
+    print(f"[SFT] Step 1/6: Loading tokenizer from: {args.backbone}")
+    tokenizer = AutoTokenizer.from_pretrained(args.backbone, trust_remote_code=True)
 
     print("[SFT] Step 2/6: Loading backbone model")
     model = AutoModelForCausalLM.from_pretrained(
-        model_source,
+        args.backbone,
         dtype=torch.bfloat16,
         device_map="auto",
     )
