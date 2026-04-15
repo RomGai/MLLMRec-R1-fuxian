@@ -277,14 +277,14 @@ class RecSFTDataset(Dataset):
 
     def _build_prompt(self, history_ids, candidates, reasoning):
         lines = [
-            "You are a movie recommendation assistant.",
-            "Here are the user's most recently watched movies sequence:",
+            "You are an e-commerce product recommendation assistant.",
+            "Here are the user's most recent interaction sequence with products:",
         ]
         for i, iid in enumerate(history_ids, 1):
             title = self.id2title.get(iid, "Unknown Title")
             lines.append(f"{i}. [ITEM_{iid}] {title}")
 
-        lines.extend(["", "Candidate movies:"])
+        lines.extend(["", "Candidate products:"])
         for iid in candidates:
             title = self.id2title.get(iid, "Unknown Title")
             lines.append(f"[ITEM_{iid}] {title}")
@@ -300,7 +300,7 @@ class RecSFTDataset(Dataset):
             [
                 "",
                 "Now answer the following question.\n"
-                "Only output in format [ITEM_xxxx] Movie Title.\n"
+                "Only output in format [ITEM_xxxx] Product Title.\n"
                 "No additional caption, summary, comments, or explanation.",
             ]
         )
@@ -395,9 +395,9 @@ class RecGRPODataset(Dataset):
         if instruction_template is None:
             instruction_template = (
                 "\n\n[OUTPUT GUIDELINES]\n"
-                "You MUST answer with only one movie from candidate movies.\n"
+                "You MUST answer with only one product from candidate products.\n"
                 "The output token MUST be in the form:\n"
-                "[ITEM_xxxx] Movie Title\n\n"
+                "[ITEM_xxxx] Product Title\n\n"
                 "If you want to provide reasoning, you may append it ONLY after answer\n"
                 "in a single line using:\n"
                 "<think> your reasoning here </think>\n\n"
