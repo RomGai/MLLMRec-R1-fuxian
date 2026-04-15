@@ -1,104 +1,50 @@
 import argparse
+import json
 import math
 import os
+import random
 import re
-import json
+
+import pandas as pd
 import torch
 import torch.distributed as dist
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from utils.data_loader import RecSFTDataset
-import pandas as pd
+
+
+METRIC_CUTOFFS = [10, 20, 40]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Top-K generation eval for RecSFT model")
+    parser = argparse.ArgumentParser(description="Ranking eval with 1 target + random negatives")
 
-    parser.add_argument("--dataset", type=str, required=True, help="Dataset name, e.g. microlens / netflix / movielens ...")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
     parser.add_argument("--root", type=str, default="/root/autodl-tmp/MLLMRec-R1", help="Project root path")
-    parser.add_argument("--backbone", type=str, default="Qwen3-4B", help="Backbone")
-    parser.add_argument("--top_k", type=int, default=3, help="Top-K for HR@K and NDCG@K")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="Qwen/Qwen3-4B",
+        help="HF backbone id when --sft_tag is not provided",
+    )
     parser.add_argument("--min_inter", type=int, default=10, help="user sequence length")
-    parser.add_argument("--num_neg", type=int, default=9, help="negative samples per user for RecSFTDataset (test)")
-    parser.add_argument("--device", type=str, default="cuda", help="device for inference, e.g. cuda / cpu (non-distributed only)")
-    parser.add_argument("--sft_tag", type=str, default=None, help="SFT model tag used as initialization, e.g. Qwen3-4B-SFT")
-    parser.add_argument("--tag", type=str, default=None, help="LoRA adapter dir name under ROOT/checkpoints/DATASET/")
-    parser.add_argument("--distributed", action="store_true", help="Use torchrun multi-GPU data-parallel inference")
+    parser.add_argument("--num_rand", type=int, default=1000, help="number of random negatives per user")
+    parser.add_argument("--device", type=str, default="cuda", help="cuda/cpu (non-distributed only)")
+    parser.add_argument("--sft_tag", type=str, default=None, help="Optional local SFT checkpoint tag")
+    parser.add_argument("--tag", type=str, default=None, help="Optional LoRA adapter dir under checkpoints/<dataset>/")
+    parser.add_argument("--distributed", action="store_true", help="Use torchrun multi-GPU data parallel inference")
+    parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
 
 
 def build_user_messages(prompt: str):
-    """
-    Build messages in the same format as messages[0] during SFT training,
-    and reuse this format at inference time.
-    """
     return [{"role": "user", "content": prompt}]
 
 
-def extract_item_id(text: str):
-    """
-    Extract an item ID of the form ITEM_xxxx from the generated text.
-
-    As long as the model output contains '[ITEM_1234]' or 'ITEM 1234'
-    (with optional '_', space, or '-' after 'ITEM'), we treat it as a valid ID.
-    """
-    m = re.search(r"ITEM[_\s-]?(\d+)", text)
-    return m.group(1) if m else None
-
-
-def generate_topk_items(
-    model,
-    tokenizer,
-    prompt: str,
-    top_k: int,
-    device: str,
-):
-    """
-    Use free-form generation to obtain Top-K recommended item IDs.
-
-    The model is prompted to output K lines in the format:
-        [ITEM_xxx]
-        [ITEM_xxx]
-        ...
-    Then we parse all 'ITEM_xxx' occurrences and keep the first K.
-    """
-    user_messages = build_user_messages(
-        prompt
-        # + f"\nMUST RECOMMEND {top_k} ITEMS!!! NOT ONE! Output format strictly:\n[ITEM_xxx]\n[ITEM_xxx]\n..."
-        + f"\nPlease recommend {top_k} items, output format strictly:\n[ITEM_xxx]\n[ITEM_xxx]\n..."
-    )
-    prompt_text = tokenizer.apply_chat_template(
-        user_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-    input_len = inputs["input_ids"].shape[1]
-
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=256,
-        do_sample=False,
-        top_p=0.7,
-        temperature=0.1,
-        # pad_token_id=tokenizer.eos_token_id,
-    )
-
-    gen = tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True)
-    ids = re.findall(r"ITEM[_\s-]?(\d+)", gen)
-    return ids[:top_k]  # Force to keep only the first K IDs
-
-
 def _init_distributed_if_needed(args):
-    """
-    Initialize torch.distributed if:
-    - args.distributed is True
-    - torchrun env vars are present
-    """
     distributed = bool(args.distributed) and ("RANK" in os.environ) and ("WORLD_SIZE" in os.environ)
 
     if distributed:
@@ -113,192 +59,239 @@ def _init_distributed_if_needed(args):
     return False, 0, 1, 0, args.device
 
 
+def _sample_eval_candidates(ex, all_item_ids, num_rand, rng):
+    target_id = str(ex["target_id"])
+
+    history_ids = set(re.findall(r"\[ITEM_(\d+)\]", ex["prompt"]))
+    forbidden = set(history_ids)
+    forbidden.add(target_id)
+
+    needed = min(num_rand, max(0, len(all_item_ids) - len(forbidden)))
+    sampled = []
+    sampled_set = set()
+    while len(sampled) < needed:
+        cand = rng.choice(all_item_ids)
+        if cand in forbidden or cand in sampled_set:
+            continue
+        sampled.append(cand)
+        sampled_set.add(cand)
+
+    candidates = [target_id] + sampled
+    rng.shuffle(candidates)
+    return candidates
+
+
+def _build_ranking_prompt(prompt_base: str, candidates):
+    lines = [prompt_base, "", "[RANKING TASK]", "Please rank ALL candidate items from best to worst."]
+    lines.append("Output item ids only, one per line, format: [ITEM_xxxx]")
+    lines.append("Rank list:")
+    for cid in candidates:
+        lines.append(f"[ITEM_{cid}]")
+    return "\n".join(lines)
+
+
+def generate_ranked_items(model, tokenizer, prompt: str, device: str, max_count: int):
+    user_messages = build_user_messages(prompt)
+    prompt_text = tokenizer.apply_chat_template(
+        user_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    input_len = inputs["input_ids"].shape[1]
+
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=min(4096, 8 * max_count),
+        do_sample=False,
+        top_p=0.7,
+        temperature=0.1,
+    )
+
+    gen = tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True)
+    ids = re.findall(r"ITEM[_\s-]?(\d+)", gen)
+
+    ranked = []
+    seen = set()
+    for item in ids:
+        if item not in seen:
+            ranked.append(item)
+            seen.add(item)
+        if len(ranked) >= max_count:
+            break
+    return ranked
+
+
+def _metric_update(ranked_ids, target_id, agg):
+    try:
+        rank_pos = ranked_ids.index(target_id) + 1
+    except ValueError:
+        rank_pos = None
+
+    for k in METRIC_CUTOFFS:
+        hit = 1 if rank_pos is not None and rank_pos <= k else 0
+        agg[f"hit@{k}"] += hit
+        if hit:
+            agg[f"ndcg@{k}"] += 1.0 / math.log2(rank_pos + 1)
+
+    agg["count"] += 1
+    return rank_pos
+
+
+def _metric_avg_str(agg):
+    c = max(1, agg["count"])
+    parts = []
+    for k in METRIC_CUTOFFS:
+        hr = agg[f"hit@{k}"] / c
+        ndcg = agg[f"ndcg@{k}"] / c
+        parts.append(f"HR@{k}={hr:.4f}, NDCG@{k}={ndcg:.4f}")
+    return " | ".join(parts)
+
+
 def main():
     args = parse_args()
+    rng = random.Random(args.seed)
 
-    distributed, rank, world_size, local_rank, DEVICE = _init_distributed_if_needed(args)
+    distributed, rank, world_size, _, device = _init_distributed_if_needed(args)
 
-    ROOT = args.root
-    DATASET = args.dataset
-    TOP_K = args.top_k
-    NUM_INTER = args.min_inter
-    NUM_NEG = args.num_neg
-    SFT_TAG = args.sft_tag
-    TAG = args.tag
-    BACKBONE = args.backbone
-
-    if TAG is None:
-        raise ValueError("--tag must be provided (LoRA adapter dir name).")
-
-    if SFT_TAG is None:
-        BASE_MODEL = f"{ROOT}/{BACKBONE}"
+    if args.sft_tag:
+        base_model = f"{args.root}/checkpoints/{args.dataset}/{args.sft_tag}"
+        print(f"[INF] Step 1/6: Using local SFT model {base_model}")
     else:
-        BASE_MODEL = f"{ROOT}/checkpoints/{DATASET}/{SFT_TAG}"
+        base_model = args.backbone
+        print(f"[INF] Step 1/6: Using HF backbone {base_model}")
 
-    ADAPTER_DIR = f"{ROOT}/checkpoints/{DATASET}/{TAG}"
-
-    # ---- Load tokenizer ----
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    print("[INF] Step 2/6: Loading tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ---- Load base model ----
-    # IMPORTANT:
-    # - For distributed data-parallel inference: each process loads model on its local GPU.
-    # - Avoid mixing device_map="auto" with model.to(device) in this mode.
+    print("[INF] Step 3/6: Loading model")
     if distributed:
-        base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to(DEVICE)
+        model_base = AutoModelForCausalLM.from_pretrained(base_model, dtype=torch.bfloat16, trust_remote_code=True).to(device)
     else:
-        # keep original behavior (but fix dtype arg name)
-        base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL,
+        model_base = AutoModelForCausalLM.from_pretrained(
+            base_model,
             dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
         )
 
-    # ---- Load LoRA adapter on top of the base model ----
-    model = PeftModel.from_pretrained(base_model, ADAPTER_DIR)
+    model = model_base
+    if args.tag:
+        adapter_dir = f"{args.root}/checkpoints/{args.dataset}/{args.tag}"
+        print(f"[INF] Step 4/6: Loading LoRA adapter {adapter_dir}")
+        model = PeftModel.from_pretrained(model_base, adapter_dir)
+    else:
+        print("[INF] Step 4/6: No LoRA adapter, evaluate base model directly")
+
     model.eval()
     if not distributed:
-        model.to(DEVICE)  # keep your original behavior
+        model.to(device)
 
-    # === Build test dataset ===
+    print("[INF] Step 5/6: Building test dataset")
     test_ds = RecSFTDataset(
-        root_path=ROOT,
-        dataset_name=DATASET,
+        root_path=args.root,
+        dataset_name=args.dataset,
         split="test",
-        num_neg=NUM_NEG,
-        min_interactions=NUM_INTER,
+        num_neg=1,
+        min_interactions=args.min_inter,
         mode="generate",
-        seed=42,
+        seed=args.seed,
     )
+    all_item_ids = list(test_ds.id2title.keys())
+    print(f"[INF] Test users={len(test_ds)}, item_pool={len(all_item_ids)}")
 
-    # Local metrics / results (per-rank)
-    total_local = 0
-    hit_k_local = 0
-    ndcg_k_sum_local = 0.0
+    indices = list(range(rank, len(test_ds), world_size))
+    iterator = tqdm(indices, desc=f"Ranking eval (world_size={world_size})") if ((not distributed) or rank == 0) else indices
+
+    agg_local = {"count": 0, "hit@10": 0, "hit@20": 0, "hit@40": 0, "ndcg@10": 0.0, "ndcg@20": 0.0, "ndcg@40": 0.0}
     results_local = []
 
-    # Shard indices by rank
-    indices = list(range(rank, len(test_ds), world_size))
-
-    iterator = indices
-    if (not distributed) or rank == 0:
-        iterator = tqdm(indices, desc=f"Gen-TopK eval (world_size={world_size})")
-
-    for idx in iterator:
+    print("[INF] Step 6/6: Start per-user ranking inference")
+    for local_i, idx in enumerate(iterator, 1):
         ex = test_ds[idx]
-        prompt = ex["prompt"]
-        target_id = ex["target_id"]  # e.g. "1129"
+        target_id = str(ex["target_id"])
 
-        gen_ids = generate_topk_items(
+        candidates = _sample_eval_candidates(ex, all_item_ids, args.num_rand, rng)
+        ranking_prompt = _build_ranking_prompt(ex["prompt"], candidates)
+        ranked_ids = generate_ranked_items(
             model=model,
             tokenizer=tokenizer,
-            prompt=prompt,
-            top_k=TOP_K,
-            device=DEVICE,
+            prompt=ranking_prompt,
+            device=device,
+            max_count=len(candidates),
         )
 
-        total_local += 1
+        rank_pos = _metric_update(ranked_ids, target_id, agg_local)
+        running = _metric_avg_str(agg_local)
+        print(
+            f"[INF][rank={rank}] user_idx={idx} processed={agg_local['count']} "
+            f"target_rank={rank_pos} | running_avg: {running}"
+        )
 
-        # Optional: print first few cases on rank0 only
-        if ((not distributed) or rank == 0) and total_local <= 5:
-            print("\n=== Case", total_local, "===")
-            print("Target ID :", target_id)
-            print("Gen Top-K :", gen_ids)
-
-        # If empty generation -> miss
-        if len(gen_ids) == 0:
-            results_local.append({
-                "index": None,  # global index set later (rank0 can reindex)
+        results_local.append(
+            {
+                "index": idx,
                 "target_id": target_id,
-                "pred_topk": gen_ids,
-                "hit": 0,
-                "rank": None,
-            })
-            continue
-
-        hit = int(target_id in gen_ids)
-        if hit:
-            hit_k_local += 1
-            r = gen_ids.index(target_id) + 1
-            ndcg_k_sum_local += 1.0 / math.log2(r + 1)
-            rank_pos = r
-        else:
-            rank_pos = None
-
-        results_local.append({
-            "index": None,
-            "target_id": target_id,
-            "pred_topk": gen_ids,
-            "hit": hit,
-            "rank": rank_pos,
-        })
-
-    # ---- Gather results + reduce metrics ----
-    if distributed:
-        # Gather Python objects (results) from all ranks
-        gathered = [None for _ in range(world_size)]
-        dist.all_gather_object(gathered, results_local)
-        results = [x for part in gathered for x in part]
-
-        # Reduce scalar metrics
-        metrics = torch.tensor(
-            [total_local, hit_k_local, ndcg_k_sum_local],
-            device=DEVICE,
-            dtype=torch.float64
+                "num_candidates": len(candidates),
+                "target_rank": rank_pos,
+                "pred_ranked": ranked_ids,
+            }
         )
-        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        total = int(metrics[0].item())
-        hit_k = int(metrics[1].item())
-        ndcg_k_sum = float(metrics[2].item())
+
+    if distributed:
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, {"results": results_local, "agg": agg_local})
+
+        if rank == 0:
+            all_results = []
+            total_agg = {"count": 0, "hit@10": 0, "hit@20": 0, "hit@40": 0, "ndcg@10": 0.0, "ndcg@20": 0.0, "ndcg@40": 0.0}
+            for part in gathered:
+                all_results.extend(part["results"])
+                for k, v in part["agg"].items():
+                    total_agg[k] += v
+        else:
+            all_results = None
+            total_agg = None
     else:
-        results = results_local
-        total = total_local
-        hit_k = hit_k_local
-        ndcg_k_sum = ndcg_k_sum_local
+        all_results = results_local
+        total_agg = agg_local
 
-    # ---- Only rank0 saves / prints ----
     if (not distributed) or rank == 0:
-        hr_k = hit_k / total if total > 0 else 0.0
-        ndcg_k = ndcg_k_sum / total if total > 0 else 0.0
-
-        print(f"\nTotal test: {total}")
-        print(f"Gen HR@{TOP_K}   : {hr_k:.4f}")
-        print(f"Gen NDCG@{TOP_K} : {ndcg_k:.4f}")
-
-        # Reindex for readability
-        for i, r in enumerate(results, 1):
-            r["index"] = i
-
-        # Save
-        result_dir = f"{ROOT}/result/{DATASET}"
-        os.makedirs(result_dir, exist_ok=True)
-
-        save_path = os.path.join(result_dir, f"{TAG}_{DATASET}_top{TOP_K}.csv")
-        df = pd.DataFrame(results)
-        df.to_csv(save_path, index=False, encoding="utf-8-sig")
-        print(f"\n[Saved Results] {save_path}")
-
+        total = max(1, total_agg["count"])
         summary = {
-            "dataset": DATASET,
-            "top_k": TOP_K,
-            "HR@K": hr_k,
-            "NDCG@K": ndcg_k,
-            "total_test": total,
+            "dataset": args.dataset,
+            "num_rand": args.num_rand,
+            "total_test": total_agg["count"],
+            "HR@10": total_agg["hit@10"] / total,
+            "HR@20": total_agg["hit@20"] / total,
+            "HR@40": total_agg["hit@40"] / total,
+            "NDCG@10": total_agg["ndcg@10"] / total,
+            "NDCG@20": total_agg["ndcg@20"] / total,
+            "NDCG@40": total_agg["ndcg@40"] / total,
             "distributed": bool(distributed),
             "world_size": world_size,
         }
 
-        summary_path = os.path.join(result_dir, f"{TAG}_{DATASET}_top{TOP_K}.json")
-        with open(summary_path, "w", encoding="utf-8") as f:
+        print("\n[INF][FINAL] " + " | ".join([f"{k}={v:.4f}" for k, v in summary.items() if isinstance(v, float)]))
+
+        result_dir = f"{args.root}/result/{args.dataset}"
+        os.makedirs(result_dir, exist_ok=True)
+
+        tag_name = args.tag if args.tag else "base"
+        save_prefix = f"{tag_name}_{args.dataset}_rand{args.num_rand}"
+
+        save_csv = os.path.join(result_dir, f"{save_prefix}.csv")
+        pd.DataFrame(all_results).to_csv(save_csv, index=False, encoding="utf-8-sig")
+        print(f"[INF][Saved Results] {save_csv}")
+
+        save_json = os.path.join(result_dir, f"{save_prefix}.json")
+        with open(save_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        print(f"[Saved Metrics] {summary_path}")
+        print(f"[INF][Saved Metrics] {save_json}")
 
     if distributed:
         dist.barrier()
