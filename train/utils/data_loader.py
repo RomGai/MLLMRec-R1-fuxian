@@ -15,6 +15,25 @@ def _read_table_auto(path: str) -> pd.DataFrame:
     return pd.read_csv(path, sep=sep)
 
 
+def _read_item_desc_table(file_obj_or_path):
+    """
+    Robust reader for item_desc tables.
+    Some rows may contain extra tabs inside summary text and trigger ParserError
+    in pandas C engine. We fallback to python engine and skip malformed rows.
+    """
+    try:
+        return pd.read_csv(file_obj_or_path, sep="\t")
+    except pd.errors.ParserError as e:
+        print(f"[WARN] item_desc parse error with C engine: {e}")
+        print("[WARN] Fallback: engine='python', on_bad_lines='skip'")
+        return pd.read_csv(
+            file_obj_or_path,
+            sep="\t",
+            engine="python",
+            on_bad_lines="skip",
+        )
+
+
 class InteractionDataset(Dataset):
     """
     Basic interaction dataset.
@@ -204,18 +223,24 @@ class RecSFTDataset(Dataset):
         desc_tsv = f"{root_path}/data/{dataset_name}_item_desc.tsv"
         desc_zip = f"{root_path}/data/{dataset_name}_item_desc.zip"
         if os.path.exists(desc_tsv):
-            desc_df = _read_table_auto(desc_tsv)
+            desc_df = _read_item_desc_table(desc_tsv)
         elif os.path.exists(desc_zip):
             with zipfile.ZipFile(desc_zip) as zf:
                 tsv_name = next((x for x in zf.namelist() if x.endswith(".tsv")), None)
                 if tsv_name is None:
                     raise FileNotFoundError(f"No .tsv found in {desc_zip}")
                 with zf.open(tsv_name) as f:
-                    desc_df = pd.read_csv(f, sep="\t")
+                    desc_df = _read_item_desc_table(f)
         else:
             raise FileNotFoundError(
                 f"Cannot find item text file for dataset '{dataset_name}'. "
                 f"Tried {titles_path}, {desc_tsv}, {desc_zip}"
+            )
+
+        if "item_id" not in desc_df.columns:
+            raise ValueError(
+                f"Invalid item_desc format for dataset '{dataset_name}': "
+                f"expected column 'item_id', got columns={list(desc_df.columns)}"
             )
 
         text_col = "summary" if "summary" in desc_df.columns else desc_df.columns[1]
