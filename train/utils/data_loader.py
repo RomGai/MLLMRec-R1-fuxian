@@ -162,6 +162,11 @@ class RecSFTDataset(Dataset):
 
         self.processed_dir = f"{root_path}/data/{dataset_name}/processed"
         os.makedirs(self.processed_dir, exist_ok=True)
+        # Item metadata is required by both cache-build and cache-load paths.
+        # Keep it initialized before any early return so downstream code can
+        # always rely on `id2title` / `all_item_ids` attributes.
+        self.id2title = self._load_item_text(root_path, dataset_name)
+        self.all_item_ids = list(self.id2title.keys())
 
         if use_cot:
             self.cache_file = os.path.join(
@@ -194,8 +199,6 @@ class RecSFTDataset(Dataset):
             history_len=self.history_len,
         )
 
-        self.id2title = self._load_item_text(root_path, dataset_name)
-
         self.idx2reasoning = {}
         if os.path.exists(self.cot_path):
             with open(self.cot_path, "r", encoding="utf-8") as f:
@@ -204,7 +207,6 @@ class RecSFTDataset(Dataset):
                 if "line_idx" in row:
                     self.idx2reasoning[int(row["line_idx"])] = str(row.get("reasoning", ""))
 
-        self.all_item_ids = list(self.id2title.keys())
         self.samples = []
         self._build_all_samples()
 
